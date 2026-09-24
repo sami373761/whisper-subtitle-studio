@@ -1,0 +1,3 @@
+# Desktop studio dependencies, on top of requirements.txt.
+PyQt6
+auditok

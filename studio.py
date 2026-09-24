@@ -9,6 +9,7 @@ highlighted, and click-anywhere-to-seek.
 import os
 import re
 import sys
+import threading
 import zlib
 from dataclasses import dataclass, field
 
@@ -19,10 +20,12 @@ from PyQt6.QtCore import (
     Qt,
     QThread,
     QUrl,
+    pyqtProperty,
     pyqtSignal,
 )
 from PyQt6.QtGui import QColor, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -33,6 +36,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSlider,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -64,6 +68,26 @@ MEDIA_FILTER = ";;".join([
     "All files (*)",
 ])
 
+
+def is_video_file(path):
+    """True for a container that plausibly carries a video stream.
+
+    A first guess from the name only -- the player confirms it against the real
+    track list once the file has loaded.
+    """
+    return os.path.splitext(str(path))[1].lstrip(".").lower() in VIDEO_EXT
+
+
+# Side-by-side split. With a video loaded the preview takes this share of the
+# content width and the lyrics take the rest; an audio-only file collapses the
+# left pane entirely and the lyrics run the full width.
+VIDEO_SPLIT = 0.70
+VIDEO_REVEAL_MS = 260
+
+# The lyrics never shrink past this, so a wide video cannot squeeze the text
+# column down to an unreadable ribbon on a narrow window.
+LYRICS_MIN_W = 240
+
 # Voice activity detection. auditok is a pure-Python energy gate: no model, no
 # download, so the app stays self-contained. It strips quiet, not music -- an
 # energy gate cannot tell the two apart -- so the repetition guards below carry
@@ -90,6 +114,12 @@ MIN_CUE_DURATION = 0.2   # seconds
 REPETITION_RATIO = 2.4
 REPETITION_MIN_CHARS = 32   # below this, gzip overhead makes the ratio meaningless
 
+# Status parameters that name a quantity. Each is worded through a "<name>_one"
+# / "<name>_other" pair of keys rather than by appending an "s", because the
+# rule is the locale's to make: Turkish takes no plural after a numeral at all
+# ("1 kelime", "32 kelime"), and German's plural of "Untertitel" is "Untertitel".
+PLURAL_PARAMS = ("words", "lines", "cues")
+
 # UI strings per locale. Keys missing from a locale fall back to English, so a
 # partial translation degrades to English rather than showing a raw key.
 STRINGS = {
@@ -100,6 +130,8 @@ STRINGS = {
         "language": "Language",
         "transcribe": "Transcribe",
         "transcribing_btn": "Transcribing…",
+        "cancel": "Cancel",
+        "cancel_tip": "Stop the running transcription",
         "volume": "Vol",
         "export_srt": "Export SRT",
         "export_vtt": "Export VTT",
@@ -113,7 +145,14 @@ STRINGS = {
         "loading_whisper": "Loading Whisper…",
         "loading_model": "Loading model '{model}' (first run downloads it)…",
         "transcribing": "Transcribing with '{model}'…",
-        "transcribed": "Transcribed {count} words in {lines} lines with '{model}'",
+        "transcribed": "Transcribed {words} in {lines} with '{model}'",
+        "words_one": "{n} word",
+        "words_other": "{n} words",
+        "lines_one": "{n} line",
+        "lines_other": "{n} lines",
+        "cues_one": "{n} cue",
+        "cues_other": "{n} cues",
+        "cancelled": "Transcription cancelled",
         "no_speech": "No speech found in this file",
         "failed": "Transcription failed — {error}",
         "jumped": "Jumped to {secs:.2f}s — “{word}”",
@@ -124,7 +163,7 @@ STRINGS = {
         "edit_off": "Edit mode off — click seeks again",
         "save_srt": "Save SRT",
         "save_vtt": "Save VTT",
-        "exported": "Exported {count} cues to {name}",
+        "exported": "Exported {cues} to {name}",
         "export_failed": "Export failed — {error}",
         "vad_unavailable": "Voice detection unavailable, transcribing without it…",
     },
@@ -135,6 +174,8 @@ STRINGS = {
         "language": "Dil",
         "transcribe": "Deşifre Et",
         "transcribing_btn": "Deşifre ediliyor…",
+        "cancel": "İptal",
+        "cancel_tip": "Süren deşifre işlemini durdur",
         "volume": "Ses",
         "export_srt": "SRT Dışa Aktar",
         "export_vtt": "VTT Dışa Aktar",
@@ -148,7 +189,14 @@ STRINGS = {
         "loading_whisper": "Whisper yükleniyor…",
         "loading_model": "'{model}' modeli yükleniyor (ilk çalıştırmada indirilir)…",
         "transcribing": "'{model}' ile deşifre ediliyor…",
-        "transcribed": "{count} kelime, {lines} satır '{model}' ile deşifre edildi",
+        "transcribed": "{words}, {lines} '{model}' ile deşifre edildi",
+        "words_one": "{n} kelime",
+        "words_other": "{n} kelime",
+        "lines_one": "{n} satır",
+        "lines_other": "{n} satır",
+        "cues_one": "{n} altyazı",
+        "cues_other": "{n} altyazı",
+        "cancelled": "Deşifre iptal edildi",
         "no_speech": "Bu dosyada konuşma bulunamadı",
         "failed": "Deşifre başarısız — {error}",
         "jumped": "{secs:.2f}sn konumuna atlandı — “{word}”",
@@ -159,7 +207,7 @@ STRINGS = {
         "edit_off": "Düzenleme modu kapalı — tıklama yine atlar",
         "save_srt": "SRT Kaydet",
         "save_vtt": "VTT Kaydet",
-        "exported": "{count} altyazı {name} dosyasına aktarıldı",
+        "exported": "{cues} {name} dosyasına aktarıldı",
         "export_failed": "Dışa aktarma başarısız — {error}",
         "vad_unavailable": "Ses algılama kullanılamıyor, onsuz deşifre ediliyor…",
     },
@@ -170,6 +218,8 @@ STRINGS = {
         "language": "Idioma",
         "transcribe": "Transcribir",
         "transcribing_btn": "Transcribiendo…",
+        "cancel": "Cancelar",
+        "cancel_tip": "Detener la transcripción en curso",
         "volume": "Vol",
         "export_srt": "Exportar SRT",
         "export_vtt": "Exportar VTT",
@@ -183,7 +233,14 @@ STRINGS = {
         "loading_whisper": "Cargando Whisper…",
         "loading_model": "Cargando el modelo '{model}' (la primera vez se descarga)…",
         "transcribing": "Transcribiendo con '{model}'…",
-        "transcribed": "{count} palabras en {lines} líneas transcritas con '{model}'",
+        "transcribed": "Transcripción con '{model}': {words} en {lines}",
+        "words_one": "{n} palabra",
+        "words_other": "{n} palabras",
+        "lines_one": "{n} línea",
+        "lines_other": "{n} líneas",
+        "cues_one": "{n} subtítulo",
+        "cues_other": "{n} subtítulos",
+        "cancelled": "Transcripción cancelada",
         "no_speech": "No se encontró voz en este archivo",
         "failed": "Error en la transcripción — {error}",
         "jumped": "Saltado a {secs:.2f}s — “{word}”",
@@ -194,7 +251,7 @@ STRINGS = {
         "edit_off": "Modo edición desactivado — el clic vuelve a saltar",
         "save_srt": "Guardar SRT",
         "save_vtt": "Guardar VTT",
-        "exported": "{count} subtítulos exportados a {name}",
+        "exported": "Exportación: {cues} a {name}",
         "export_failed": "Error al exportar — {error}",
         "vad_unavailable": "Detección de voz no disponible, transcribiendo sin ella…",
     },
@@ -205,6 +262,8 @@ STRINGS = {
         "language": "Sprache",
         "transcribe": "Transkribieren",
         "transcribing_btn": "Transkribiere…",
+        "cancel": "Abbrechen",
+        "cancel_tip": "Laufende Transkription stoppen",
         "volume": "Lautst.",
         "export_srt": "SRT exportieren",
         "export_vtt": "VTT exportieren",
@@ -218,7 +277,14 @@ STRINGS = {
         "loading_whisper": "Whisper wird geladen…",
         "loading_model": "Modell '{model}' wird geladen (beim ersten Mal heruntergeladen)…",
         "transcribing": "Transkribiere mit '{model}'…",
-        "transcribed": "{count} Wörter in {lines} Zeilen mit '{model}' transkribiert",
+        "transcribed": "{words} in {lines} mit '{model}' transkribiert",
+        "words_one": "{n} Wort",
+        "words_other": "{n} Wörter",
+        "lines_one": "{n} Zeile",
+        "lines_other": "{n} Zeilen",
+        "cues_one": "{n} Untertitel",
+        "cues_other": "{n} Untertitel",
+        "cancelled": "Transkription abgebrochen",
         "no_speech": "In dieser Datei wurde keine Sprache gefunden",
         "failed": "Transkription fehlgeschlagen — {error}",
         "jumped": "Zu {secs:.2f}s gesprungen — „{word}“",
@@ -229,7 +295,7 @@ STRINGS = {
         "edit_off": "Bearbeitungsmodus aus — Klick springt wieder",
         "save_srt": "SRT speichern",
         "save_vtt": "VTT speichern",
-        "exported": "{count} Untertitel nach {name} exportiert",
+        "exported": "{cues} nach {name} exportiert",
         "export_failed": "Export fehlgeschlagen — {error}",
         "vad_unavailable": "Spracherkennung nicht verfügbar, Transkription ohne sie…",
     },
@@ -716,6 +782,76 @@ class LyricsView(QTextEdit):
         )
 
 
+class Cancelled(Exception):
+    """Raised inside the worker thread to unwind a transcription on request."""
+
+
+class VideoPane(QFrame):
+    """The left half of the split: the video preview, centred in its own space.
+
+    The pane is only ever as wide as the splitter makes it. QVideoWidget does
+    the rest -- KeepAspectRatio letterboxes the picture and centres it, so the
+    frame keeps its natural proportions at any split position.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("videoPane")
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+
+        self.video = QVideoWidget()
+        self.video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        box.addWidget(self.video)
+
+        # Both have to be free to reach zero width, or the splitter could never
+        # collapse the pane away for an audio-only file.
+        self.video.setMinimumSize(1, 1)
+        self.setMinimumWidth(0)
+        self.setVisible(False)
+
+
+class ContentSplitter(QSplitter):
+    """Video on the left, lyrics on the right, with a draggable split between.
+
+    The reveal animates `videoShare` rather than the sizes directly: a splitter's
+    sizes are a list, not a Qt property, so there is nothing for an animation to
+    drive. Reducing the split to one number between 0 and 1 also survives a
+    window resize, which a pixel width would not.
+    """
+
+    def __init__(self):
+        super().__init__(Qt.Orientation.Horizontal)
+        self._share = 0.0
+        self.setObjectName("content")
+        self.setChildrenCollapsible(True)
+        self.splitterMoved.connect(self._on_dragged)
+
+    def _on_dragged(self, *_):
+        """Adopt a split the user dragged, so later resizes keep their ratio."""
+        left, right = (self.sizes() + [0, 0])[:2]
+        total = left + right
+        if total:
+            self._share = left / total
+
+    def apply_share(self):
+        """Re-impose the current split on the current width."""
+        total = sum(self.sizes())
+        if total <= 0:
+            return
+        left = int(round(total * self._share))
+        self.setSizes([left, total - left])
+
+    def _get_video_share(self):
+        return self._share
+
+    def _set_video_share(self, share):
+        self._share = max(0.0, min(1.0, float(share)))
+        self.apply_share()
+
+    videoShare = pyqtProperty(float, _get_video_share, _set_video_share)
+
+
 class TranscribeWorker(QObject):
     """Runs whisper-timestamped off the GUI thread.
 
@@ -728,17 +864,57 @@ class TranscribeWorker(QObject):
     progress = pyqtSignal(str, dict)
     finished = pyqtSignal(list)   # list[Line]
     failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
 
     def __init__(self, path, model_name):
         super().__init__()
         self.path = path
         self.model_name = model_name
+        self._cancel = threading.Event()
+
+    # -- cancellation -----------------------------------------------------
+
+    def cancel(self):
+        """Ask the run to stop. Called from the GUI thread; never blocks it."""
+        self._cancel.set()
+
+    @property
+    def is_cancelled(self):
+        return self._cancel.is_set()
+
+    def _checkpoint(self, *_hook_args):
+        """Unwind if cancel was asked for. Doubles as a torch forward hook.
+
+        Whisper exposes no cancel flag, so stage boundaries alone would leave a
+        long decode running for minutes after the click. The model itself is the
+        way in: a forward hook runs on every pass, and raising from it unwinds
+        inference exactly like any other error -- whisper-timestamped removes its
+        own hooks in a `finally`, so nothing is left attached to the model.
+        """
+        if self._cancel.is_set():
+            raise Cancelled()
+
+    def _install_hooks(self, model):
+        """Attach the cancel checkpoint to the hottest modules in the graph.
+
+        conv1 runs once per 30s window, token_embedding once per decoded token,
+        which puts the worst-case delay between click and unwind at one token.
+        A backend without these modules still cancels, just at stage boundaries.
+        """
+        handles = []
+        for owner, name in ((model.encoder, "conv1"), (model.decoder, "token_embedding")):
+            module = getattr(owner, name, None)
+            if module is not None:
+                handles.append(module.register_forward_hook(self._checkpoint))
+        return handles
 
     def run(self):
         try:
+            self._checkpoint()
             self.progress.emit("loading_whisper", {})
             import whisper_timestamped as whisper
 
+            self._checkpoint()
             self.progress.emit("loading_model", {"model": self.model_name})
             model = whisper.load_model(self.model_name)
 
@@ -752,22 +928,29 @@ class TranscribeWorker(QObject):
                 self.progress.emit("vad_unavailable", {})
                 vad = False
 
+            self._checkpoint()
             self.progress.emit("transcribing", {"model": self.model_name})
-            result = whisper.transcribe(
-                model,
-                self.path,
-                language=None,   # Whisper always detects the spoken language itself
-                vad=vad,
-                temperature=TEMPERATURE_FALLBACK,
-                # Music and noise make Whisper latch onto its own last output and
-                # loop it; not feeding the previous text back breaks the cycle.
-                condition_on_previous_text=False,
-                # Drops zero-length words Whisper tacks onto segment ends -- the
-                # main source of word-highlight drift.
-                remove_empty_words=True,
-                verbose=None,
-            )
+            handles = self._install_hooks(model)
+            try:
+                result = whisper.transcribe(
+                    model,
+                    self.path,
+                    language=None,   # Whisper always detects the spoken language itself
+                    vad=vad,
+                    temperature=TEMPERATURE_FALLBACK,
+                    # Music and noise make Whisper latch onto its own last output and
+                    # loop it; not feeding the previous text back breaks the cycle.
+                    condition_on_previous_text=False,
+                    # Drops zero-length words Whisper tacks onto segment ends -- the
+                    # main source of word-highlight drift.
+                    remove_empty_words=True,
+                    verbose=None,
+                )
+            finally:
+                for handle in handles:
+                    handle.remove()
 
+            self._checkpoint()
             lines = []
             for segment in result.get("segments", []):
                 words = [
@@ -781,9 +964,16 @@ class TranscribeWorker(QObject):
                     continue        # a loop Whisper spun over music or noise
                 lines.append(line)
             self.finished.emit(collapse_repeats(lines))
+        except Cancelled:
+            self.cancelled.emit()
         except Exception as exc:
-            # Anything from a bad codec to an OOM lands here; the UI stays alive.
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            # A cancel that unwound through torch can surface re-wrapped as some
+            # other error type, so the flag -- not the exception -- decides.
+            if self._cancel.is_set():
+                self.cancelled.emit()
+            else:
+                # Anything from a bad codec to an OOM lands here; the UI stays alive.
+                self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class Studio(QMainWindow):
@@ -798,6 +988,10 @@ class Studio(QMainWindow):
         self._thread = None
         self._worker = None
         self._busy = False
+        self._video_shown = False
+        # Cancelled threads still have to unwind; holding them here keeps Qt from
+        # collecting a QThread that is mid-flight, which would abort the process.
+        self._retiring = set()
         self.locale = DEFAULT_LOCALE
         self._status = ("ready", {})   # (key, params), re-rendered on locale change
 
@@ -818,6 +1012,7 @@ class Studio(QMainWindow):
         self.player.durationChanged.connect(self._on_duration)
         self.player.playbackStateChanged.connect(self._on_playback_state)
         self.player.errorOccurred.connect(self._on_player_error)
+        self.player.mediaStatusChanged.connect(self._on_media_status)
 
     def _build_ui(self):
         root = QWidget()
@@ -825,13 +1020,100 @@ class Studio(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # The bars span the full window; only the content between them splits.
         layout.addWidget(self._build_topbar())
-        self.transcript = LyricsView(on_seek=self.seek_to)
-        layout.addWidget(self.transcript, stretch=1)
+        layout.addWidget(self._build_content(), stretch=1)
         layout.addWidget(self._build_bottombar())
 
         self.setCentralWidget(root)
         self.setStyleSheet(STYLESHEET)
+
+    def _build_content(self):
+        """The split content area: video left, lyrics right."""
+        self.transcript = LyricsView(on_seek=self.seek_to)
+        self.video_pane = VideoPane()
+        self.video = self.video_pane.video
+        self.player.setVideoOutput(self.video)
+
+        self.splitter = ContentSplitter()
+        self.splitter.addWidget(self.video_pane)
+        self.splitter.addWidget(self._build_lyrics_pane())
+        # Spare width goes to the lyrics, and only the video side may collapse --
+        # the transcript is the one pane that must never disappear.
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setCollapsible(0, True)
+        self.splitter.setCollapsible(1, False)
+
+        self._video_reveal = QPropertyAnimation(self.splitter, b"videoShare", self)
+        self._video_reveal.setDuration(VIDEO_REVEAL_MS)
+        self._video_reveal.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._video_reveal.finished.connect(self._on_video_reveal_done)
+        return self.splitter
+
+    def _build_lyrics_pane(self):
+        """The right half: the type-size controls above the transcript itself."""
+        pane = QWidget()
+        pane.setObjectName("lyricsPane")
+        pane.setMinimumWidth(LYRICS_MIN_W)
+        column = QVBoxLayout(pane)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+
+        header = QFrame()
+        header.setObjectName("lyricsHeader")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(6)
+
+        self.font_down_btn = QPushButton("A−")
+        self.font_down_btn.setObjectName("chip")
+        self.font_down_btn.setFixedWidth(38)
+        self.font_down_btn.clicked.connect(lambda: self.scale_font(-FONT_STEP))
+
+        self.font_up_btn = QPushButton("A+")
+        self.font_up_btn.setObjectName("chip")
+        self.font_up_btn.setFixedWidth(38)
+        self.font_up_btn.clicked.connect(lambda: self.scale_font(+FONT_STEP))
+
+        # Right-aligned, so they sit out of the way of the text they scale.
+        row.addStretch(1)
+        row.addWidget(self.font_down_btn)
+        row.addWidget(self.font_up_btn)
+
+        column.addWidget(header)
+        column.addWidget(self.transcript, stretch=1)
+        return pane
+
+    def _show_video(self, on):
+        """Open or close the split, sliding the divider either way."""
+        on = bool(on)
+        if on == self._video_shown:
+            return
+        self._video_shown = on
+        self._video_reveal.stop()
+        if on:
+            # Shown before the slide so there is something to animate open;
+            # collapsing hides it only once the split has reached zero.
+            self.video_pane.setVisible(True)
+        self._video_reveal.setStartValue(self.splitter.videoShare)
+        self._video_reveal.setEndValue(VIDEO_SPLIT if on else 0.0)
+        self._video_reveal.start()
+
+    def _on_video_reveal_done(self):
+        if not self._video_shown:
+            # Hidden outright, so the splitter drops its handle too and the
+            # lyrics get the full width rather than a zero-width neighbour.
+            self.video_pane.setVisible(False)
+
+    def resizeEvent(self, event):
+        """Hold the split ratio steady as the window changes width."""
+        super().resizeEvent(event)
+        # Qt delivers the first resize while __init__ is still building widgets.
+        if not getattr(self, "_video_shown", False):
+            return
+        if self._video_reveal.state() != QPropertyAnimation.State.Running:
+            self.splitter.apply_share()
 
     def _build_topbar(self):
         bar = QFrame()
@@ -845,16 +1127,6 @@ class Studio(QMainWindow):
 
         self.file_label = QLabel()
         self.file_label.setObjectName("fileLabel")
-
-        self.font_down_btn = QPushButton("A−")
-        self.font_down_btn.setObjectName("chip")
-        self.font_down_btn.setFixedWidth(38)
-        self.font_down_btn.clicked.connect(lambda: self.scale_font(-FONT_STEP))
-
-        self.font_up_btn = QPushButton("A+")
-        self.font_up_btn.setObjectName("chip")
-        self.font_up_btn.setFixedWidth(38)
-        self.font_up_btn.clicked.connect(lambda: self.scale_font(+FONT_STEP))
 
         self.edit_btn = QPushButton()
         self.edit_btn.setCheckable(True)
@@ -876,11 +1148,15 @@ class Studio(QMainWindow):
         self.transcribe_btn.setObjectName("primary")
         self.transcribe_btn.clicked.connect(self.transcribe)
 
+        # Only on screen while a run is in flight -- there is nothing to cancel
+        # otherwise, and a permanently dead button just adds noise to the bar.
+        self.cancel_btn = QPushButton()
+        self.cancel_btn.setObjectName("danger")
+        self.cancel_btn.clicked.connect(self.cancel_transcribe)
+        self.cancel_btn.setVisible(False)
+
         row.addWidget(self.open_btn)
         row.addWidget(self.file_label, stretch=1)
-        row.addWidget(self.font_down_btn)
-        row.addWidget(self.font_up_btn)
-        row.addSpacing(6)
         row.addWidget(self.edit_btn)
         row.addSpacing(6)
         row.addWidget(self.model_label)
@@ -890,6 +1166,7 @@ class Studio(QMainWindow):
         row.addWidget(self.language_box)
         row.addSpacing(6)
         row.addWidget(self.transcribe_btn)
+        row.addWidget(self.cancel_btn)
         return bar
 
     def _build_bottombar(self):
@@ -950,7 +1227,18 @@ class Studio(QMainWindow):
     # -- i18n -------------------------------------------------------------
 
     def tr(self, key, **params):
-        """Render a UI string in the active locale, falling back to English."""
+        """Render a UI string in the active locale, falling back to English.
+
+        Counts arrive as raw numbers and are worded here rather than by the
+        caller: a status is stored as its key plus parameters and re-rendered on
+        every locale change, so picking singular or plural any earlier would
+        freeze one locale's wording into a message that outlives it.
+        """
+        for name in PLURAL_PARAMS:
+            count = params.get(name)
+            if isinstance(count, int):
+                suffix = "one" if count == 1 else "other"
+                params[name] = self.tr(f"{name}_{suffix}", n=count)
         template = STRINGS[self.locale].get(key) or STRINGS[DEFAULT_LOCALE][key]
         return template.format(**params)
 
@@ -971,6 +1259,8 @@ class Studio(QMainWindow):
         self.srt_btn.setText(self.tr("export_srt"))
         self.vtt_btn.setText(self.tr("export_vtt"))
         self.edit_btn.setText(self.tr("edit"))
+        self.cancel_btn.setText(self.tr("cancel"))
+        self.cancel_btn.setToolTip(self.tr("cancel_tip"))
 
         self.model_box.setToolTip(self.tr("model_tip"))
         self.language_box.setToolTip(self.tr("language_tip"))
@@ -1005,6 +1295,9 @@ class Studio(QMainWindow):
 
         self.media_path = path
         self.player.setSource(QUrl.fromLocalFile(path))
+        # The extension decides right away so the pane does not flash open on an
+        # audio file; hasVideo() corrects it once the media has actually loaded.
+        self._show_video(is_video_file(path))
         self._leave_edit_mode()
         self.transcript.set_lines([])
         self.file_label.setText(path.rsplit("/", 1)[-1])
@@ -1048,7 +1341,7 @@ class Studio(QMainWindow):
         except OSError as exc:
             self.set_status("export_failed", error=str(exc))
             return
-        self.set_status("exported", count=len(cues), name=os.path.basename(path))
+        self.set_status("exported", cues=len(cues), name=os.path.basename(path))
 
     def scale_font(self, delta):
         self.transcript.apply_font_size(self.transcript.font_px + delta)
@@ -1063,34 +1356,75 @@ class Studio(QMainWindow):
         self.transcript.set_lines([])
         self._update_actions()
 
-        self._thread = QThread(self)
-        self._worker = TranscribeWorker(self.media_path, self.model_box.currentText())
-        self._worker.moveToThread(self._thread)
+        thread = QThread(self)
+        worker = TranscribeWorker(self.media_path, self.model_box.currentText())
+        worker.moveToThread(thread)
+        self._thread, self._worker = thread, worker
 
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(lambda key, params: self.set_status(key, **params))
-        self._worker.finished.connect(self._on_transcribed)
-        self._worker.failed.connect(self._on_transcribe_failed)
+        thread.started.connect(worker.run)
+        # Connected as plain bound methods, not lambdas, so each handler can ask
+        # sender() whether the signal came from the worker that is still current.
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_transcribed)
+        worker.failed.connect(self._on_transcribe_failed)
+        worker.cancelled.connect(self._on_transcribe_cancelled)
 
-        # Both outcomes stop the thread; deleteLater keeps the objects alive
+        # Every outcome stops the thread; deleteLater keeps the objects alive
         # until the event loop has finished dispatching their signals.
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.failed.connect(self._thread.quit)
-        self._thread.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._on_thread_done)
+        for signal in (worker.finished, worker.failed, worker.cancelled):
+            signal.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda: self._on_thread_done(thread))
 
-        self._thread.start()
+        thread.start()
+
+    def cancel_transcribe(self):
+        """Stop the running transcription and hand the UI straight back.
+
+        The worker cannot be killed, only asked to unwind, and that takes as long
+        as the current forward pass. Rather than freeze the window for it, the
+        worker is retired here and now: it is dropped from `_worker`, so the
+        signals it may still emit are recognised as stale and ignored, and its
+        thread is parked in `_retiring` until it finishes on its own.
+        """
+        worker, thread = self._worker, self._thread
+        if worker is None or thread is None:
+            return
+
+        worker.cancel()
+        self._worker, self._thread = None, None
+        self._retiring.add(thread)
+
+        self._busy = False
+        self.set_status("cancelled")
+        self._update_actions()
+
+    def _is_current_worker(self):
+        """True when the signal being handled came from the live worker.
+
+        A cancelled worker's queued signals are already sitting in the event loop
+        and still get delivered after the disconnect would have happened, so
+        identity -- not the connection -- is what tells stale ones apart.
+        """
+        return self._worker is not None and self.sender() is self._worker
 
     def _leave_edit_mode(self):
         self.edit_btn.setChecked(False)
         self.transcript.set_editing(False)
 
+    def _on_progress(self, key, params):
+        if not self._is_current_worker():
+            return
+        self.set_status(key, **params)
+
     def _on_transcribed(self, lines):
+        if not self._is_current_worker():
+            return
         self.transcript.set_lines(lines)
         if lines:
             self.set_status(
                 "transcribed",
-                count=sum(len(l.words) for l in lines),
+                words=sum(len(l.words) for l in lines),
                 lines=len(lines),
                 model=self.model_box.currentText(),
             )
@@ -1098,14 +1432,27 @@ class Studio(QMainWindow):
             self.set_status("no_speech")
 
     def _on_transcribe_failed(self, message):
+        if not self._is_current_worker():
+            return
         self.set_status("failed", error=condense_error(message))
         self.status_label.setToolTip(message)
 
-    def _on_thread_done(self):
-        self._busy = False
-        self._thread.deleteLater()
+    def _on_transcribe_cancelled(self):
+        # A worker that beat the cancel to the finish line is already retired and
+        # the status already reads "cancelled"; nothing is left to report.
+        if not self._is_current_worker():
+            return
+        self.set_status("cancelled")
+
+    def _on_thread_done(self, thread):
+        """Tear down a finished thread -- current or retiring, same cleanup."""
+        self._retiring.discard(thread)
+        thread.deleteLater()
+        if thread is not self._thread:
+            return   # a cancelled run; the UI went back to ready when it was asked to
         self._thread = None
         self._worker = None
+        self._busy = False
         self._update_actions()
 
     def seek_to(self, seconds, label=""):
@@ -1127,6 +1474,7 @@ class Studio(QMainWindow):
         self.transcribe_btn.setText(
             self.tr("transcribing_btn" if self._busy else "transcribe")
         )
+        self.cancel_btn.setVisible(self._busy)
         self.play_btn.setEnabled(has_media)
         self.position_slider.setEnabled(has_media)
         self.srt_btn.setEnabled(has_lines)
@@ -1152,6 +1500,17 @@ class Studio(QMainWindow):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.play_btn.setText("⏸" if playing else "▶")
 
+    def _on_media_status(self, status):
+        """Once the media is really loaded, let the track list have the last word.
+
+        An .mp4 can carry no video stream, and a container this platform cannot
+        decode has nothing to show either -- both should leave the pane closed
+        however promising the extension looked.
+        """
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia,
+                      QMediaPlayer.MediaStatus.BufferedMedia):
+            self._show_video(self.player.hasVideo())
+
     def _on_player_error(self, error, message):
         if error != QMediaPlayer.Error.NoError:
             self.set_status("playback_error", error=message or error.name)
@@ -1174,15 +1533,20 @@ class Studio(QMainWindow):
     # -- shutdown ---------------------------------------------------------
 
     def closeEvent(self, event):
-        """Let a running transcription finish unwinding before we tear down.
+        """Let every transcription finish unwinding before we tear down.
 
-        Destroying a QThread that is still running aborts the process, and a
-        Whisper pass cannot be interrupted mid-inference.
+        Destroying a QThread that is still running aborts the process, so each
+        one is cancelled first -- that turns the wait from a whole Whisper pass
+        into a single forward pass -- and only then joined. Threads cancelled
+        earlier are still in `_retiring`, and they have to be joined too.
         """
         self.player.stop()
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(15000)
+        if self._worker is not None:
+            self._worker.cancel()
+        for thread in list(self._retiring) + [self._thread]:
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait(15000)
         event.accept()
 
 
@@ -1191,6 +1555,15 @@ QWidget { background: #121212; color: #ffffff; font-size: 13px; }
 
 QFrame#topBar    { background: #181818; border-bottom: 1px solid #282828; }
 QFrame#bottomBar { background: #181818; border-top: 1px solid #282828; }
+
+/* Split content area: video left, lyrics right. */
+QFrame#videoPane    { background: #000000; }
+QWidget#lyricsPane  { background: #121212; }
+QFrame#lyricsHeader { background: #121212; border-bottom: 1px solid #1f1f1f; }
+
+QSplitter#content::handle:horizontal { background: #282828; width: 6px; }
+QSplitter#content::handle:horizontal:hover    { background: #3a3a3a; }
+QSplitter#content::handle:horizontal:pressed  { background: #1ed760; }
 
 QLabel { color: #b3b3b3; background: transparent; }
 QLabel#fileLabel { color: #ffffff; font-weight: 600; background: transparent; }
@@ -1214,6 +1587,12 @@ QPushButton#primary {
 QPushButton#primary:hover:enabled  { background: #24e96b; border-color: #24e96b; }
 QPushButton#primary:pressed:enabled { background: #17b850; }
 QPushButton#primary:disabled { background: #1a1a1a; border-color: #262626; color: #5a5a5a; }
+
+QPushButton#danger {
+    background: #2a1416; border-color: #5c2126; color: #ff8e8e; font-weight: 600;
+}
+QPushButton#danger:hover:enabled  { background: #3a1a1d; border-color: #7a2b32; }
+QPushButton#danger:pressed:enabled { background: #221012; }
 
 QPushButton#chip { padding: 8px 0; font-weight: 700; border-radius: 8px; }
 
