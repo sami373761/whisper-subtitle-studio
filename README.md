@@ -1,7 +1,7 @@
 # whisper-timestamped
   
 Multilingual Automatic Speech Recognition with word-level timestamps and confidence.
-  
+    
 * [Description](#description)
    * [Notes on other approaches](#notes-on-other-approaches)
 * [Installation](#installation)
